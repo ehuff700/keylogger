@@ -1,17 +1,15 @@
-use std::io::Write;
+use std::{char::REPLACEMENT_CHARACTER, io::Write};
 
 use keylogger::KeyLogger;
-use spin::Mutex;
 
 #[test]
 fn main() {
-    let mut kl = KeyLogger::init().unwrap();
-    let buffer: Mutex<Vec<char>> = Mutex::new(Vec::new());
+    let kl = KeyLogger::init().unwrap();
+    let mut buffer: Vec<char> = Vec::new();
     let test = kl.start_logging(move |c| {
-        let mut lock = buffer.lock();
         let code = c as u32;
         if code == 32 || code == 13 {
-            for c in lock.drain(0..) {
+            for c in buffer.drain(0..) {
                 print!("{}", c);
             }
             if code == 32 {
@@ -21,10 +19,9 @@ fn main() {
                 println!();
                 let _ = std::io::stdout().flush();
             }
-        } else if c != '\0' {
-            lock.push(c)
+        } else if c != REPLACEMENT_CHARACTER {
+            buffer.push(c)
         }
-        drop(lock);
     });
     if let Err(e) = test {
         println!("{}", e);
